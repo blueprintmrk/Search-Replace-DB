@@ -2,7 +2,7 @@
 
 /**
  *
- * Safe Search and Replace on Database with Serialized Data v3.0.0
+ * Safe Search and Replace on Database with Serialized Data v3.1.0
  *
  * This script is to solve the problem of doing database search and replace when
  * some data is stored within PHP serialized arrays or objects.
@@ -36,6 +36,13 @@
  * License: GPL v3
  * License URL: http://www.gnu.org/copyleft/gpl.html
  *
+ *
+ * Version 3.1.0:
+ *		* Added port number option to both web and CLI interfaces.
+ *		* More reliable fallback on non-PDO systems.
+ *		* Confirmation on 'Delete me'
+ *		* Comprehensive check to prevent accidental deletion of web projects
+ *		* Removed mysql functions and replaced with mysqli
  *
  * Version 3.0:
  * 		* Major overhaul
@@ -163,6 +170,7 @@ class icit_srdb {
 	public $user = '';
 	public $pass = '';
 	public $host = '127.0.0.1';
+	public $port = 0;
 	public $charset = 'utf8';
 	public $collate = '';
 
@@ -227,6 +235,7 @@ class icit_srdb {
 	 * @param string $user    database username
 	 * @param string $pass    database password
 	 * @param string $host    database hostname
+	 * @param string $port    database connection port
 	 * @param string $search  search string / regex
 	 * @param string $replace replacement string
 	 * @param array $tables  tables to run replcements against
@@ -242,6 +251,7 @@ class icit_srdb {
 			'user' 				=> '',
 			'pass' 				=> '',
 			'host' 				=> '',
+			'port'              => 3306,
 			'search' 			=> '',
 			'replace' 			=> '',
 			'tables'			=> array(),
@@ -261,10 +271,30 @@ class icit_srdb {
 		// handle errors
 		set_error_handler( array( $this, 'errors' ), E_ERROR | E_WARNING );
 
+		// Setting this so that mb_split works correctly.
+		// BEAR IN MIND that this affects the handling of strings INTERNALLY rather than
+		// at the html output interface, the console interface, json interface, or the database interface.
+		// This means that if the DB has a different charset (utf16?), we need to make sure that it's
+		// normalised to utf-8 internally and output in the appropriate charset.
+		mb_regex_encoding( 'UTF-8' );
+
 		// allow a string for columns
 		foreach( array( 'exclude_cols', 'include_cols', 'tables' ) as $maybe_string_arg ) {
 			if ( is_string( $args[ $maybe_string_arg ] ) )
 				$args[ $maybe_string_arg ] = array_filter( array_map( 'trim', explode( ',', $args[ $maybe_string_arg ] ) ) );
+		}
+		
+		// verify that the port number is logical		
+		// work around PHPs inability to stringify a zero without making it an empty string
+		// AND without casting away trailing characters if they are present.
+		$port_as_string = (string)$args['port'] ? (string)$args['port'] : "0";		
+		if ( (string)abs( (int)$args['port'] ) !== $port_as_string ) {
+			$port_error = 'Port number must be a positive integer if specified.';
+			$this->add_error( $port_error, 'db' );
+			if ( defined( 'STDIN' ) ) {
+				echo 'Error: ' . $port_error;	
+			}
+			return;
 		}
 
 		// set class vars
@@ -375,12 +405,38 @@ class icit_srdb {
 
 	/**
 	 * Setup connection, populate tables array
+	 * Also responsible for selecting the type of connection to use.
 	 *
 	 * @return void
 	 */
 	public function db_setup() {
+		$mysqli_available = class_exists( 'mysqli' );
+		$pdo_available    = class_exists( 'PDO'    );
 
-		$connection_type = class_exists( 'PDO' ) ? 'pdo' : 'mysql';
+		$connection_type = '';
+
+		// Default to mysqli type.
+		// Only advance to PDO if all conditions are met.
+		if ( $mysqli_available )
+		{
+			$connection_type = 'mysqli';
+		}
+
+		if ( $pdo_available ) {
+			// PDO is the interface, but it may not have the 'mysql' module.
+			$mysql_driver_present = in_array( 'mysql', pdo_drivers() );
+
+			if ( $mysql_driver_present ) {
+				$connection_type = 'pdo';
+			}
+		}
+
+		// Abort if mysqli and PDO are both broken.
+		if ( '' === $connection_type )
+		{
+			$this->add_error( 'Could not find any MySQL database drivers. (MySQLi or PDO required.)', 'db' );
+			return false;
+		}
 
 		// connect
 		$this->set( 'db', $this->connect( $connection_type ) );
@@ -402,27 +458,21 @@ class icit_srdb {
 
 
 	/**
-	 * Creates the database connection using old mysql functions
+	 * Creates the database connection using newer mysqli functions
 	 *
 	 * @return resource|bool
 	 */
-	public function connect_mysql() {
+	public function connect_mysqli() {
 
 		// switch off PDO
 		$this->set( 'use_pdo', false );
 
-		$connection = @mysql_connect( $this->host, $this->user, $this->pass );
+		$connection = @mysqli_connect( $this->host, $this->user, $this->pass, $this->name, $this->port );
 
 		// unset if not available
 		if ( ! $connection ) {
+			$this->add_error( mysqli_connect_error( ), 'db' );
 			$connection = false;
-			$this->add_error( mysql_error(), 'db' );
-		}
-
-		// select the database for non PDO
-		if ( $connection && ! mysql_select_db( $this->name, $connection ) ) {
-			$connection = false;
-			$this->add_error( mysql_error(), 'db' );
 		}
 
 		return $connection;
@@ -435,9 +485,9 @@ class icit_srdb {
 	 * @return PDO|bool
 	 */
 	public function connect_pdo() {
-
+	
 		try {
-			$connection = new PDO( "mysql:host={$this->host};dbname={$this->name}", $this->user, $this->pass );
+			$connection = new PDO( "mysql:host={$this->host};port={$this->port};dbname={$this->name}", $this->user, $this->pass );
 		} catch( PDOException $e ) {
 			$this->add_error( $e->getMessage(), 'db' );
 			$connection = false;
@@ -445,7 +495,9 @@ class icit_srdb {
 
 		// check if there's a problem with our database at this stage
 		if ( $connection && ! $connection->query( 'SHOW TABLES' ) ) {
-			$this->add_error( array_pop( $connection->errorInfo() ), 'db' );
+			$error_info = $connection->errorInfo();
+			if ( !empty( $error_info ) && is_array( $error_info ) )
+				$this->add_error( array_pop( $error_info ), 'db' ); // Array pop will only accept a $var..
 			$connection = false;
 		}
 
@@ -459,9 +511,36 @@ class icit_srdb {
 	 * @return array
 	 */
 	public function get_tables() {
-
 		// get tables
-		$all_tables_mysql = $this->db_query( 'SHOW TABLE STATUS' );
+
+		// A clone of show table status but with character set for the table.
+		$show_table_status = "SELECT
+		  t.`TABLE_NAME` as Name,
+		  t.`ENGINE` as `Engine`,
+		  t.`version` as `Version`,
+		  t.`ROW_FORMAT` AS `Row_format`,
+		  t.`TABLE_ROWS` AS `Rows`,
+		  t.`AVG_ROW_LENGTH` AS `Avg_row_length`,
+		  t.`DATA_LENGTH` AS `Data_length`,
+		  t.`MAX_DATA_LENGTH` AS `Max_data_length`,
+		  t.`INDEX_LENGTH` AS `Index_length`,
+		  t.`DATA_FREE` AS `Data_free`,
+		  t.`AUTO_INCREMENT` as `Auto_increment`,
+		  t.`CREATE_TIME` AS `Create_time`,
+		  t.`UPDATE_TIME` AS `Update_time`,
+		  t.`CHECK_TIME` AS `Check_time`,
+		  t.`TABLE_COLLATION` as Collation,
+		  c.`CHARACTER_SET_NAME` as Character_set,
+		  t.`Checksum`,
+		  t.`Create_options`,
+		  t.`table_Comment` as `Comment`
+		FROM information_schema.`TABLES` t
+			LEFT JOIN information_schema.`COLLATION_CHARACTER_SET_APPLICABILITY` c
+				ON ( t.`TABLE_COLLATION` = c.`COLLATION_NAME` )
+		  WHERE t.`TABLE_SCHEMA` = '{$this->name}';
+		";
+
+		$all_tables_mysql = $this->db_query( $show_table_status );
 		$all_tables = array();
 
 		if ( ! $all_tables_mysql ) {
@@ -484,6 +563,39 @@ class icit_srdb {
 		}
 
 		return $all_tables;
+	}
+
+
+	/**
+	 * Get the character set for the current table
+	 *
+	 * @param string $table_name The name of the table we want to get the char
+	 * set for
+	 *
+	 * @return string    The character encoding;
+	 */
+	public function get_table_character_set( $table_name = '' ) {
+		$table_name = $this->db_escape( $table_name );
+		$schema = $this->db_escape( $this->name );
+
+		$charset = $this->db_query(  "SELECT c.`character_set_name`
+			FROM information_schema.`TABLES` t
+				LEFT JOIN information_schema.`COLLATION_CHARACTER_SET_APPLICABILITY` c
+				ON (t.`TABLE_COLLATION` = c.`COLLATION_NAME`)
+			WHERE t.table_schema = {$schema}
+				AND t.table_name = {$table_name}
+			LIMIT 1;" );
+
+		$encoding = false;
+		if ( ! $charset ) {
+			$this->add_error( $this->db_error( ), 'db' );
+		}
+		else {
+			$result = $this->db_fetch( $charset );
+			$encoding = isset( $result[ 'character_set_name' ] ) ? $result[ 'character_set_name' ] : false;
+		}
+
+		return $encoding;
 	}
 
 
@@ -515,48 +627,50 @@ class icit_srdb {
 		if ( $this->use_pdo() )
 			return $this->db->query( $query );
 		else
-			return mysql_query( $query, $this->db );
+			return mysqli_query( $this->db, $query );
 	}
 
 	public function db_update( $query ) {
 		if ( $this->use_pdo() )
 			return $this->db->exec( $query );
 		else
-			return mysql_query( $query, $this->db );
+			return mysqli_query( $this->db, $query );
 	}
 
 	public function db_error() {
-		if ( $this->use_pdo() )
-			return array_pop( $this->db->errorInfo() );
+		if ( $this->use_pdo() ) {
+			$error_info = $this->db->errorInfo();
+			return !empty( $error_info ) && is_array( $error_info ) ? array_pop( $error_info ) : 'Unknown error';
+		}
 		else
-			return mysql_error();
+			return mysqli_error( $this->db );
 	}
 
 	public function db_fetch( $data ) {
 		if ( $this->use_pdo() )
 			return $data->fetch();
 		else
-			return mysql_fetch_array( $data );
+			return mysqli_fetch_array( $data );
 	}
 
 	public function db_escape( $string ) {
 		if ( $this->use_pdo() )
 			return $this->db->quote( $string );
 		else
-			return "'" . mysql_real_escape_string( $string ) . "'";
+			return "'" . mysqli_real_escape_string( $this->db, $string ) . "'";
 	}
 
 	public function db_free_result( $data ) {
 		if ( $this->use_pdo() )
 			return $data->closeCursor();
 		else
-			return mysql_free_result( $data );
+			return mysqli_free_result( $data );
 	}
 
 	public function db_set_charset( $charset = '' ) {
 		if ( ! empty( $charset ) ) {
-			if ( ! $this->use_pdo() && function_exists( 'mysql_set_charset' ) )
-				mysql_set_charset( $charset, $this->db );
+			if ( ! $this->use_pdo() && function_exists( 'mysqli_set_charset' ) )
+				mysqli_set_charset( $this->db, $charset );
 			else
 				$this->db_query( 'SET NAMES ' . $charset );
 		}
@@ -566,7 +680,7 @@ class icit_srdb {
 		if ( $this->use_pdo() )
 			unset( $this->db );
 		else
-			mysql_close( $this->db );
+			mysqli_close( $this->db );
 	}
 
 	public function db_valid() {
@@ -694,9 +808,9 @@ class icit_srdb {
 	 * @return array    Collection of information gathered during the run.
 	 */
 	public function replacer( $search = '', $replace = '', $tables = array( ) ) {
-
+		$search = (string)$search;
 		// check we have a search string, bail if not
-		if ( empty( $search ) ) {
+		if ( '' === $search ) {
 			$this->add_error( 'Search string is empty', 'search' );
 			return false;
 		}
@@ -736,16 +850,33 @@ class icit_srdb {
 
 			foreach( $tables as $table ) {
 
+				$encoding = $this->get_table_character_set( $table );
+				switch( $encoding ) {
+
+					// Tables encoded with this work for me only when I set names to utf8. I don't trust this in the wild so I'm going to avoid.
+					case 'utf16':
+					case 'utf32':
+						//$encoding = 'utf8';
+						$this->add_error( "The table \"{$table}\" is encoded using \"{$encoding}\" which is currently unsupported.", 'results' );
+						continue;
+						break;
+
+					default:
+						$this->db_set_charset( $encoding );
+						break;
+				}
+
+
 				$report[ 'tables' ]++;
 
 				// get primary key and columns
 				list( $primary_key, $columns ) = $this->get_columns( $table );
-
-				if ( $primary_key === null ) {
+				
+				if ( $primary_key === null || empty( $primary_key ) ) {
 					$this->add_error( "The table \"{$table}\" has no primary key. Changes will have to be made manually.", 'results' );
 					continue;
 				}
-
+				
 				// create new table report instance
 				$new_table_report = $table_report;
 				$new_table_report[ 'start' ] = microtime();
@@ -783,7 +914,7 @@ class icit_srdb {
 
 							$edited_data = $data_to_fix = $row[ $column ];
 
-							if ( $primary_key == $column ) {
+							if ( in_array( $column, $primary_key ) ) {
 								$where_sql[] = "`{$column}` = " . $this->db_escape( $data_to_fix );
 								continue;
 							}
@@ -795,7 +926,7 @@ class icit_srdb {
 							// include cols
 							if ( ! empty( $this->include_cols ) && ! in_array( $column, $this->include_cols ) )
 								continue;
-
+							
 							// Run a search replace on the data that'll respect the serialisation.
 							$edited_data = $this->recursive_unserialize_replace( $search, $replace, $data_to_fix );
 
@@ -810,8 +941,8 @@ class icit_srdb {
 									$new_table_report[ 'changes' ][] = array(
 										'row' => $new_table_report[ 'rows' ],
 										'column' => $column,
-										'from' => utf8_encode( $data_to_fix ),
-										'to' => utf8_encode( $edited_data )
+										'from' => ( $data_to_fix ),
+										'to' => ( $edited_data )
 									);
 								}
 
@@ -827,6 +958,7 @@ class icit_srdb {
 						} elseif ( $update && ! empty( $where_sql ) ) {
 
 							$sql = 'UPDATE ' . $table . ' SET ' . implode( ', ', $update_sql ) . ' WHERE ' . implode( ' AND ', array_filter( $where_sql ) );
+							
 							$result = $this->db_update( $sql );
 
 							if ( ! is_int( $result ) && ! $result ) {
@@ -867,8 +999,7 @@ class icit_srdb {
 
 
 	public function get_columns( $table ) {
-
-		$primary_key = null;
+		$primary_key = array();
 		$columns = array( );
 
 		// Get a list of columns in this table
@@ -879,7 +1010,7 @@ class icit_srdb {
 			while( $column = $this->db_fetch( $fields ) ) {
 				$columns[] = $column[ 'Field' ];
 				if ( $column[ 'Key' ] == 'PRI' )
-					$primary_key = $column[ 'Field' ];
+					$primary_key[] = $column[ 'Field' ];
 			}
 		}
 
@@ -911,8 +1042,9 @@ class icit_srdb {
 
 			$report = array( 'engine' => $engine, 'converted' => array() );
 
+			$all_tables = $this->get_tables();
+			
 			if ( empty( $tables ) ) {
-				$all_tables = $this->get_tables();
 				$tables = array_keys( $all_tables );
 			}
 
@@ -961,8 +1093,9 @@ class icit_srdb {
 
 			$report = array( 'collation' => $collation, 'converted' => array() );
 
+			$all_tables = $this->get_tables();
+				
 			if ( empty( $tables ) ) {
-				$all_tables = $this->get_tables();
 				$tables = array_keys( $all_tables );
 			}
 

@@ -1,10 +1,9 @@
 #!/usr/bin/php -q
-
 <?php
 
 /**
  * To run this script, execute something like this:
- * `./srdb.cli.php -h localhost -u root -d test -s "findMe" -r "replaceMe"`
+ * `./srdb.cli.php -h localhost -u root -n test -s "findMe" -r "replaceMe"`
  * use the --dry-run flag to do a dry run without searching/replacing.
  */
 
@@ -12,7 +11,7 @@
 date_default_timezone_set( 'Europe/London' );
 
 // include the srdb class
-require_once( 'srdb.class.php' );
+require_once( realpath( dirname( __FILE__ ) ) . '/srdb.class.php' );
 
 $opts = array(
 	'h:' => 'host:',
@@ -30,7 +29,8 @@ $opts = array(
 	'z' => 'dry-run',
 	'e:' => 'alter-engine:',
 	'a:' => 'alter-collation:',
-	'v::' => 'verbose::',
+	'v:' => 'verbose:',
+	'port:',
 	'help'
 );
 
@@ -83,6 +83,9 @@ ARGS
     Required. Database user.
   -p, --pass
     Required. Database user's password.
+  --port
+    Optional. Port on database server to connect to.
+    The default is 3306. (MySQL default port).
   -s, --search
     String to search for or `preg_replace()` style
     regular expression.
@@ -130,15 +133,15 @@ foreach( $required as $key ) {
 	$short_opt = strip_colons( $key );
 	$long_opt = strip_colons( $opts[ $key ] );
 	if ( ! isset( $options[ $short_opt ] ) && ! isset( $options[ $long_opt ] ) ) {
-		echo "Error: Missing argument, -{$short_opt} or --{$long_opt} is required.\n";
+		fwrite( STDERR, "Error: Missing argument, -{$short_opt} or --{$long_opt} is required.\n" );
 		$missing_arg = true;
 	}
 }
 
 // bail if requirements not met
 if ( $missing_arg ) {
-	echo "Please enter the missing arguments.\n";
-	exit;
+	fwrite( STDERR, "Please enter the missing arguments.\n" );
+	exit( 1 );
 }
 
 // new args array
@@ -154,15 +157,16 @@ foreach( $options as $key => $value ) {
 	if ( ( $is_short = array_search( $key, $short_opts_normal ) ) !== false )
 		$key = $long_opts_normal[ $is_short ];
 
-	// true/false string mapping
-	if ( is_string( $value ) && in_array( $value, array( 'false', 'no', '0' ) ) )
-		$value = false;
-	if ( is_string( $value ) && in_array( $value, array( 'true', 'yes', '1' ) ) )
-		$value = true;
-
 	// boolean options as is, eg. a no value arg should be set true
 	if ( in_array( $key, $long_opts ) )
 		$value = true;
+	
+	switch ( $key ) {
+		// boolean options.
+		case 'verbose':
+			$value = (boolean)filter_var( $value, FILTER_VALIDATE_BOOLEAN );
+		break;
+	}
 
 	// change to underscores
 	$key = str_replace( '-', '_', $key );
@@ -173,7 +177,7 @@ foreach( $options as $key => $value ) {
 // modify the log output
 class icit_srdb_cli extends icit_srdb {
 
-	public function log( $type ) {
+	public function log( $type = '' ) {
 
 		$args = array_slice( func_get_args(), 1 );
 
@@ -222,8 +226,13 @@ It took {$time} seconds";
 
 $report = new icit_srdb_cli( $args );
 
+// Only print a separating newline if verbose mode is on to separate verbose output from result
+if ($args[ 'verbose' ]) {
+	echo "\n";
+}
+
 if ( $report && ( ( isset( $args[ 'dry_run' ] ) && $args[ 'dry_run' ] ) || empty( $report->errors[ 'results' ] ) ) ) {
-	echo "\nAnd we're done!";
+	echo "And we're done!\n";
 } else {
-	echo "\nCheck the output for errors. You may need to ensure verbose output is on by using -v or --verbose.";
+	echo "Check the output for errors. You may need to ensure verbose output is on by using -v or --verbose.\n";
 }
